@@ -1,0 +1,17 @@
+[
+    {
+        "ID": "H-01",
+        "Title": "BuilderWallet init() is unprotected/re-initializable, enabling takeover and theft of builder fees",
+        "Path": "test/foundry/pocs/PoCH01BuilderWalletInit.t.sol"
+    },
+    {
+        "ID": "H-02",
+        "Title": "Cross-contract reentrancy in liquidation enables conversion of phantom shares to real shares, draining CollateralTracker assets",
+        "Path": "test/foundry/pocs/PoCH02LiquidationReentrancy.t.sol"
+    },
+    {
+        "ID": "H-03",
+        "Title": "Commission fees can always be bypassed",
+        "Path": "test/foundry/pocs/PoCH03CommissionFeeBypass.t.sol"
+    }
+]
