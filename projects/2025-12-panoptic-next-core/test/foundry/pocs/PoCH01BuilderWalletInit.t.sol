@@ -106,8 +106,8 @@ contract PoCH01BuilderWalletInitTest is Test {
         // Deploy mock ERC20 token
         mockToken = new MockERC20();
 
-        // Legitimate builder deploys a builder wallet via factory
-        vm.prank(LEGIT_BUILDER);
+        // Owner deploys a builder wallet via factory for the legit builder
+        vm.prank(OWNER);
         builderFactory.deployBuilder(100, LEGIT_BUILDER);
 
         // Predict the builder wallet address
