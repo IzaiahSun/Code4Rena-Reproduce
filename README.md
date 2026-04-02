@@ -12,5 +12,26 @@ Most of the bugs are reproduced by AI and some are checked by human.
 
 ```
 
+## Additional files
 
+Under each project, there are **three** additional files.
 
+- `setup_env.sh` is a script to help install the dependency.
+- `run_pocs.sh` is a script to run all the PoCs.
+- `poc_manifest.json` is a json file to list all the generated PoCs.
+
+Both `setup_env.sh` and `run_pocs.sh` should be run with the project directory as the current working directory, e.g.:
+
+```bash
+cd projects/2025-02-recall
+./setup_env.sh
+./run_pocs.sh
+```
+
+When building the environment, several package managers/commands are considered already existing on the machine (in `PATH`):
+```
+npm
+pnpm
+npx
+forge
+```
