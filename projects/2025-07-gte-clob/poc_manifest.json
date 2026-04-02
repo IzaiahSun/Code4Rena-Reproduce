@@ -1,0 +1,17 @@
+[
+    {
+        "ID": "H-01",
+        "Title": "Order double-linked list is broken because order.prevOrderId is not persisted",
+        "Path": "test/pocs/PoCH01PrevOrderIdNotPersisted.t.sol"
+    },
+    {
+        "ID": "H-02",
+        "Title": "Dust orders can block order posting",
+        "Path": "test/pocs/PoCH02DustOrders.t.sol"
+    },
+    {
+        "ID": "H-03",
+        "Title": "DOS Attack via Order Amendment Bypassing maxLimitsPerTx Protection",
+        "Path": "test/pocs/PoCH03AmendDOSTest.t.sol"
+    }
+]
