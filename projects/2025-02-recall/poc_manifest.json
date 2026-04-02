@@ -1,0 +1,47 @@
+[
+    {
+        "ID": "H-01",
+        "Title": "Missing signature duplication check in the submitCheckpoint function",
+        "Path": "contracts/test/integration/PoCH01DuplicateSignature.t.sol"
+    },
+    {
+        "ID": "H-02",
+        "Title": "Xnet call messages with value > 0 lead to inflated circulating supply of child subnet",
+        "Path": "contracts/test/integration/PoCH02InflatedCircSupply.t.sol"
+    },
+    {
+        "ID": "H-03",
+        "Title": "Reliance on incorrect hash in IpcContract.sol leads to permanent fund loss and receipt message execution failure",
+        "Path": "contracts/test/integration/PoCH03IncorrectHash.t.sol"
+    },
+    {
+        "ID": "H-04",
+        "Title": "An attacker can overflow the count of messages in a bottom up message batch leading to bottom up checkpoint execution failure and halting",
+        "Path": "contracts/test/integration/PoCH04BatchOverflow.t.sol"
+    },
+    {
+        "ID": "H-05",
+        "Title": "Incorrect supply fund transferral in function leave() can be exploited to drain locked collateral source funds in subnet actor contract",
+        "Path": "contracts/test/integration/PoCH05IncorrectLeaveTransfer.t.sol"
+    },
+    {
+        "ID": "H-06",
+        "Title": "Reentrancy in function leave() leads to halting of bottom-up checkpoints",
+        "Path": "contracts/test/integration/PoCH06ReentrancyLeave.t.sol"
+    },
+    {
+        "ID": "H-07",
+        "Title": "Incorrect loop indexing in LibAddressStakingReleases.compact() leads to unprocessed pending releases",
+        "Path": "contracts/test/integration/PoCH07IncorrectLoopIndexing.t.sol"
+    },
+    {
+        "ID": "H-08",
+        "Title": "Permissionless creation of new subnets under gateway will lead to gateway actor fund draining",
+        "Path": "contracts/test/integration/PoCH08PermissionlessSubnetCreation.t.sol"
+    },
+    {
+        "ID": "H-09",
+        "Title": "Cross msg recipient can block checkpoint submission via gas bomb",
+        "Path": "contracts/test/integration/PoCH09GasBomb.t.sol"
+    }
+]
